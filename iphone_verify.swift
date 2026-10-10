@@ -1,131 +1,108 @@
-// 第二轮：按"文件内容"核对。把手机上剩余文件下载到临时目录，计算 SHA-256，
-// 与备份中同样大小的文件逐一比对，内容完全一致（含 Live Photo 视频部分）才删除。
-// 用法: iphone_verify <备份根目录> <临时下载目录> <报告.csv> [--delete]
+// 只删除 iPhone 上"已在电脑上完整备份"的照片/视频。
+// 用法: swift iphone_prune.swift <备份根目录> <报告.csv> [--delete]
+// 不带 --delete 时只预演，不删除任何东西。
+// 匹配规则: 文件名相同 + 文件大小完全相同 + 拍摄时间相差 ≤2 秒；Live Photo 的视频部分也必须匹配。
 import Foundation
-import CryptoKit
 import ImageCaptureCore
 
 let args = CommandLine.arguments
-guard args.count >= 4 else { print("用法: iphone_verify <备份根目录> <临时目录> <报告.csv> [--delete]"); exit(1) }
-let backupRoot = args[1], tmpDir = URL(fileURLWithPath: args[2]), reportPath = args[3]
+guard args.count >= 3 else { print("用法: swift iphone_prune.swift <备份根目录> <报告.csv> [--delete]"); exit(1) }
+let backupRoot = args[1], reportPath = args[2]
 let doDelete = args.contains("--delete")
-try? FileManager.default.createDirectory(at: tmpDir, withIntermediateDirectories: true)
 
-// ---------- 备份索引：大小 -> 路径 ----------
-var bySize: [Int64: [String]] = [:]
+// ---------- 建立备份索引 ----------
+struct BFile { let size: Int64; let date: Date; let path: String }
+var index: [String: [BFile]] = [:]
+let stampFmt = DateFormatter()
+stampFmt.dateFormat = "yyyy_MM_dd_HH_mm_ss"
+stampFmt.timeZone = .current
+let re = try! NSRegularExpression(pattern: "^(\\d{4}_\\d{2}_\\d{2}_\\d{2}_\\d{2}_\\d{2})_(.+)$")
 let en = FileManager.default.enumerator(at: URL(fileURLWithPath: backupRoot),
                                         includingPropertiesForKeys: [.fileSizeKey, .isRegularFileKey])!
+var nBackup = 0
 for case let u as URL in en {
     guard let v = try? u.resourceValues(forKeys: [.fileSizeKey, .isRegularFileKey]), v.isRegularFile == true else { continue }
-    bySize[Int64(v.fileSize ?? -1), default: []].append(u.path)
+    let n = u.lastPathComponent as NSString
+    guard let m = re.firstMatch(in: n as String, range: NSRange(location: 0, length: n.length)),
+          let d = stampFmt.date(from: n.substring(with: m.range(at: 1))) else { continue }
+    let name = n.substring(with: m.range(at: 2)).uppercased()
+    index[name, default: []].append(BFile(size: Int64(v.fileSize ?? -1), date: d, path: u.path))
+    nBackup += 1
 }
-var hashCache: [String: String] = [:]
-func sha(_ path: String) -> String? {
-    if let h = hashCache[path] { return h }
-    guard let fh = FileHandle(forReadingAtPath: path) else { return nil }
-    defer { try? fh.close() }
-    var hasher = SHA256()
-    while let d = try? fh.read(upToCount: 4 << 20), !d.isEmpty { hasher.update(data: d) }
-    let h = hasher.finalize().map { String(format: "%02x", $0) }.joined()
-    hashCache[path] = h
-    return h
+print("备份索引: \(nBackup) 个文件")
+
+// ---------- 比对 ----------
+enum Status: String { case ok = "已备份", noFile = "未找到备份", sizeDiff = "大小不符", dateDiff = "时间不符" }
+func check(_ f: ICCameraFile) -> (Status, String) {
+    guard let name = f.name?.uppercased(), let cands = index[name] else { return (.noFile, "") }
+    let sized = cands.filter { $0.size == f.fileSize }
+    if sized.isEmpty { return (.sizeDiff, cands.map { "\($0.size)" }.joined(separator: "|")) }
+    let dates = [f.exifCreationDate, f.fileCreationDate, f.creationDate].compactMap { $0 }
+    if let b = sized.first(where: { b in dates.contains { abs($0.timeIntervalSince(b.date)) <= 2 } }) { return (.ok, b.path) }
+    return (.dateDiff, sized[0].path)
 }
 func csv(_ s: String) -> String { "\"" + s.replacingOccurrences(of: "\"", with: "\"\"") + "\"" }
 
 final class Ctl: NSObject, ICDeviceBrowserDelegate, ICCameraDeviceDelegate {
     let browser = ICDeviceBrowser()
     var cam: ICCameraDevice?
-    var tries = 0, sessionOpen = false
-    var report = "状态,手机文件名,大小,备份路径或备注\n"
-    var counts: [String: Int] = [:]
-    var toDelete: [ICCameraFile] = []
-
-    func start() {
-        browser.delegate = self
-        browser.browsedDeviceTypeMask = ICDeviceTypeMask(rawValue:
-            ICDeviceTypeMask.camera.rawValue | ICDeviceLocationTypeMask.local.rawValue)!
-        browser.start()
-        print("正在查找 iPhone（请解锁手机并保持亮屏，关闭爱思助手）…")
-    }
+    var tries = 0
+    var sessionOpen = false
     func reopen() {
         guard let c = cam, !sessionOpen else { return }
         tries += 1
         guard tries <= 60 else { print("等待 3 分钟仍无法访问，退出。"); exit(3) }
         c.requestOpenSession()
     }
-    func deviceBrowser(_ b: ICDeviceBrowser, didAdd device: ICDevice, moreComing: Bool) {
-        guard cam == nil, let c = device as? ICCameraDevice else { return }
-        print("找到设备: \(c.name ?? "?")")
-        cam = c; c.delegate = self; reopen()
-    }
-    func deviceBrowser(_ b: ICDeviceBrowser, didRemove device: ICDevice, moreGoing: Bool) {}
-    func device(_ device: ICDevice, didOpenSessionWithError error: Error?) {
-        guard let error else { sessionOpen = true; print("会话已打开，正在读取目录…"); return }
-        print("打开失败: \(error.localizedDescription)，3 秒后重试…")
-        DispatchQueue.main.asyncAfter(deadline: .now() + 3) { self.reopen() }
+
+    func start() {
+        browser.delegate = self
+        browser.browsedDeviceTypeMask = ICDeviceTypeMask(rawValue:
+            ICDeviceTypeMask.camera.rawValue | ICDeviceLocationTypeMask.local.rawValue)!
+        browser.start()
+        print("正在查找 iPhone（请解锁手机并保持亮屏）…")
     }
 
-    // 一个"项"= 主文件 + 非 AAE 附属文件（Live Photo 视频）
-    struct Job { let primary: ICCameraFile; let parts: [ICCameraFile] }
-    var jobs: [Job] = []
+    func deviceBrowser(_ b: ICDeviceBrowser, didAdd device: ICDevice, moreComing: Bool) {
+        guard cam == nil, let c = device as? ICCameraDevice else { return }
+        print("找到设备: \(c.name ?? "?")，正在读取目录（文件多时需几分钟）…")
+        cam = c; c.delegate = self; c.requestOpenSession()
+    }
+    func deviceBrowser(_ b: ICDeviceBrowser, didRemove device: ICDevice, moreGoing: Bool) {}
 
     func deviceDidBecomeReady(withCompleteContentCatalog device: ICCameraDevice) {
         let all = (device.mediaFiles ?? []).compactMap { $0 as? ICCameraFile }
+        // Live Photo 视频等作为 sidecar 挂在主文件下，不单独处理
         var sidecarIDs = Set<ObjectIdentifier>()
         for f in all { for s in f.sidecarFiles ?? [] { sidecarIDs.insert(ObjectIdentifier(s)) } }
-        for f in all where !sidecarIDs.contains(ObjectIdentifier(f)) {
-            let parts = [f] + (f.sidecarFiles ?? []).compactMap { $0 as? ICCameraFile }
-                .filter { !($0.name ?? "").uppercased().hasSuffix(".AAE") }
-            if let miss = parts.first(where: { bySize[$0.fileSize] == nil }) {
-                record("无同大小备份", f, miss === f ? "" : "附属文件 \(miss.name ?? "?") 无备份")
-            } else {
-                jobs.append(Job(primary: f, parts: parts))
-            }
-        }
-        print("手机上剩余 \(all.count - sidecarIDs.count) 项；需下载核对 \(jobs.count) 项")
-        nextJob(0)
-    }
+        let primaries = all.filter { !sidecarIDs.contains(ObjectIdentifier($0)) }
 
-    func record(_ st: String, _ f: ICCameraFile, _ note: String) {
-        counts[st, default: 0] += 1
-        report += [st, f.name ?? "", "\(f.fileSize)", note].map(csv).joined(separator: ",") + "\n"
-    }
-
-    func nextJob(_ i: Int) {
-        guard i < jobs.count else { summarize(); return }
-        if i % 100 == 0 { print("  核对进度 \(i)/\(jobs.count)") }
-        let job = jobs[i]
-        verifyParts(job.parts[...], matched: []) { ok, note in
-            if ok { self.toDelete.append(job.primary); self.record("内容一致", job.primary, note) }
-            else { self.record("内容不一致", job.primary, note) }
-            DispatchQueue.main.async { self.nextJob(i + 1) }
-        }
-    }
-
-    func verifyParts(_ rest: ArraySlice<ICCameraFile>, matched: [String], done: @escaping (Bool, String) -> Void) {
-        guard let f = rest.first else { done(true, matched.joined(separator: " | ")); return }
-        let opts: [ICDownloadOption: Any] = [.downloadsDirectoryURL: tmpDir, .overwrite: true]
-        _ = f.requestDownload(options: opts) { name, err in
-            DispatchQueue.main.async {
-                guard let name, err == nil else { done(false, "下载失败 \(f.name ?? "?"): \(err?.localizedDescription ?? "")"); return }
-                let local = tmpDir.appendingPathComponent(name).path
-                let h = sha(local)
-                try? FileManager.default.removeItem(atPath: local)
-                hashCache[local] = nil
-                if let h, let hit = bySize[f.fileSize]?.first(where: { sha($0) == h }) {
-                    self.verifyParts(rest.dropFirst(), matched: matched + [hit], done: done)
-                } else {
-                    done(false, "\(f.name ?? "?") 无内容相同的备份")
+        var report = "状态,手机文件名,手机大小,拍摄时间,备份路径或备注\n"
+        var toDelete: [ICCameraFile] = []
+        var counts: [String: Int] = [:]
+        let iso = ISO8601DateFormatter(); iso.timeZone = .current
+        for f in primaries {
+            var (st, note) = check(f)
+            if st == .ok {
+                for s in (f.sidecarFiles ?? []).compactMap({ $0 as? ICCameraFile }) where (s.name ?? "").uppercased().hasSuffix(".AAE") == false {
+                    let (ss, _) = check(s)
+                    if ss != .ok { st = ss; note = "Live/附属文件 \(s.name ?? "?") \(ss.rawValue)"; break }
                 }
             }
+            counts[st.rawValue, default: 0] += 1
+            if st == .ok { toDelete.append(f) }
+            let d = f.exifCreationDate ?? f.creationDate
+            report += [st.rawValue, f.name ?? "", "\(f.fileSize)", d.map { iso.string(from: $0) } ?? "", note].map(csv).joined(separator: ",") + "\n"
         }
-    }
-
-    func summarize() {
         try? report.write(toFile: reportPath, atomically: true, encoding: .utf8)
+        print("手机上共 \(primaries.count) 项（另有 \(sidecarIDs.count) 个附属文件）")
         for (k, v) in counts.sorted(by: { $0.key < $1.key }) { print("  \(k): \(v)") }
         print("报告已写入: \(reportPath)")
+
         guard doDelete else { print("预演模式，未删除任何文件。"); finish(); return }
+        guard device.capabilities.contains(ICDeviceCapability.cameraDeviceCanDeleteOneFile.rawValue) else {
+            print("该设备不允许删除文件（请确认手机已解锁并信任此电脑）"); finish(); return
+        }
         deleteBatches(toDelete[...], done: 0)
     }
 
@@ -137,14 +114,21 @@ final class Ctl: NSObject, ICDeviceBrowserDelegate, ICCameraDeviceDelegate {
         }, completion: { _, err in
             if let err { print("批次出错: \(err.localizedDescription)") }
             let n = done + batch.count
-            print("  已删除 \(n)/\(n + rest.count - batch.count)")
+            print("  已处理 \(n)/\(n + rest.count - batch.count)")
             DispatchQueue.main.async { self.deleteBatches(rest.dropFirst(batch.count), done: n) }
         })
     }
 
     func finish() { cam?.requestCloseSession(); DispatchQueue.main.asyncAfter(deadline: .now() + 1) { exit(0) } }
 
+    // 其余必需的代理方法
     func didRemove(_ device: ICDevice) { print("设备已断开"); exit(2) }
+    func device(_ device: ICDevice, didOpenSessionWithError error: Error?) {
+        guard let error else { sessionOpen = true; print("会话已打开，正在读取目录…"); return }
+        let c = device as? ICCameraDevice
+        print("第 \(tries + 1) 次打开失败: \((error as NSError).code) \(error.localizedDescription)  [访问受限=\(c?.isAccessRestrictedAppleDevice ?? false)] 3 秒后重试…")
+        DispatchQueue.main.asyncAfter(deadline: .now() + 3) { self.reopen() }
+    }
     func device(_ device: ICDevice, didCloseSessionWithError error: Error?) {}
     func cameraDevice(_ camera: ICCameraDevice, didAdd items: [ICCameraItem]) {}
     func cameraDevice(_ camera: ICCameraDevice, didRemove items: [ICCameraItem]) {}
@@ -153,11 +137,11 @@ final class Ctl: NSObject, ICDeviceBrowserDelegate, ICCameraDeviceDelegate {
     func cameraDevice(_ camera: ICCameraDevice, didReceiveMetadata metadata: [AnyHashable: Any]?, for item: ICCameraItem, error: Error?) {}
     func cameraDeviceDidChangeCapability(_ camera: ICCameraDevice) {}
     func cameraDevice(_ camera: ICCameraDevice, didReceivePTPEvent eventData: Data) {}
-    func cameraDeviceDidRemoveAccessRestriction(_ device: ICDevice) { print("访问限制已解除"); reopen() }
-    func cameraDeviceDidEnableAccessRestriction(_ device: ICDevice) { print("设备进入访问限制（锁屏？）") }
+    func cameraDeviceDidRemoveAccessRestriction(_ device: ICDevice) { print("系统通知：访问限制已解除"); reopen() }
+    func cameraDeviceDidEnableAccessRestriction(_ device: ICDevice) { print("系统通知：设备进入访问限制（锁屏？）") }
 }
 
 let ctl = Ctl()
 ctl.start()
-DispatchQueue.main.asyncAfter(deadline: .now() + 5400) { print("超时退出"); exit(4) }
+DispatchQueue.main.asyncAfter(deadline: .now() + 1800) { print("超时退出"); exit(4) }
 RunLoop.main.run()

@@ -46,6 +46,14 @@ func csv(_ s: String) -> String { "\"" + s.replacingOccurrences(of: "\"", with: 
 final class Ctl: NSObject, ICDeviceBrowserDelegate, ICCameraDeviceDelegate {
     let browser = ICDeviceBrowser()
     var cam: ICCameraDevice?
+    var tries = 0
+    var sessionOpen = false
+    func reopen() {
+        guard let c = cam, !sessionOpen else { return }
+        tries += 1
+        guard tries <= 60 else { print("等待 3 分钟仍无法访问，退出。"); exit(3) }
+        c.requestOpenSession()
+    }
 
     func start() {
         browser.delegate = self
@@ -115,7 +123,12 @@ final class Ctl: NSObject, ICDeviceBrowserDelegate, ICCameraDeviceDelegate {
 
     // 其余必需的代理方法
     func didRemove(_ device: ICDevice) { print("设备已断开"); exit(2) }
-    func device(_ device: ICDevice, didOpenSessionWithError error: Error?) { if let error { print("打开会话失败: \(error)"); exit(3) } }
+    func device(_ device: ICDevice, didOpenSessionWithError error: Error?) {
+        guard let error else { sessionOpen = true; print("会话已打开，正在读取目录…"); return }
+        let c = device as? ICCameraDevice
+        print("第 \(tries + 1) 次打开失败: \((error as NSError).code) \(error.localizedDescription)  [访问受限=\(c?.isAccessRestrictedAppleDevice ?? false)] 3 秒后重试…")
+        DispatchQueue.main.asyncAfter(deadline: .now() + 3) { self.reopen() }
+    }
     func device(_ device: ICDevice, didCloseSessionWithError error: Error?) {}
     func cameraDevice(_ camera: ICCameraDevice, didAdd items: [ICCameraItem]) {}
     func cameraDevice(_ camera: ICCameraDevice, didRemove items: [ICCameraItem]) {}
@@ -124,8 +137,8 @@ final class Ctl: NSObject, ICDeviceBrowserDelegate, ICCameraDeviceDelegate {
     func cameraDevice(_ camera: ICCameraDevice, didReceiveMetadata metadata: [AnyHashable: Any]?, for item: ICCameraItem, error: Error?) {}
     func cameraDeviceDidChangeCapability(_ camera: ICCameraDevice) {}
     func cameraDevice(_ camera: ICCameraDevice, didReceivePTPEvent eventData: Data) {}
-    func cameraDeviceDidRemoveAccessRestriction(_ device: ICDevice) {}
-    func cameraDeviceDidEnableAccessRestriction(_ device: ICDevice) {}
+    func cameraDeviceDidRemoveAccessRestriction(_ device: ICDevice) { print("系统通知：访问限制已解除"); reopen() }
+    func cameraDeviceDidEnableAccessRestriction(_ device: ICDevice) { print("系统通知：设备进入访问限制（锁屏？）") }
 }
 
 let ctl = Ctl()
