@@ -29,3 +29,9 @@
 脚本运行时会打印每次重试的状态。如果还是「访问受限=true」，说明手机  继续排查。
 
 ```
+## PS
+```
+❯ ps aux | grep iphone_verify
+xlisp            14294  20.9  0.3 38055332  46564   ??  R    10:17AM   0:04.73 /private/tmp/claude-501/-Users-xlisp-Downloads-i4ToolsDownloads-CustomizedBackup-Shunli-iPhone-2026-10-10-8-53-21--Photos------HEIC-files/e07e8177-39d0-4028-a625-26fbeed55857/scratchpad/iphone_verify /Users/xlisp/Downloads/i4ToolsDownloads/CustomizedBackup/Shunli的iPhone(2026-10-10-8-53-21)/Photos/相机胶卷 /private/tmp/claude-501/-Users-xlisp-Downloads-i4ToolsDownloads-CustomizedBackup-Shunli-iPhone-2026-10-10-8-53-21--Photos------HEIC-files/e07e8177-39d0-4028-a625-26fbeed55857/scratchpad/dl_tmp /private/tmp/claude-501/-Users-xlisp-Downloads-i4ToolsDownloads-CustomizedBackup-Shunli-iPhone-2026-10-10-8-53-21--Photos------HEIC-files/e07e8177-39d0-4028-a625-26fbeed55857/scratchpad/report2.csv --delete
+
+```
