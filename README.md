@@ -1,3 +1,4 @@
+## iPhone备份和Clean
 
 ```
 /private/tmp/claude-501/-Users-xlisp-Downloads-i4ToolsDownloads-CustomizedBackup-Shunli-iPhone-2026-10-10-8-53-21--Photos------HEIC-files/e07e8177-39d0-4028-a625-26fbeed55857/scratchpad
